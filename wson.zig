@@ -15,23 +15,67 @@ const Type = union(enum) {
     Optional: *OptionalType,
     Array: *ArrayType,
     Map: *MapType,
+
+    const Self = @This();
+
+    fn eql(self: *Self, other: *Self) bool {
+        if (self == other) {
+            return switch(self) {
+                .Optional => OptionalType.eql(self.Optional, other.Optional),
+                .Array => ArrayType.eql(self.Array, other.Array),
+                .Map => MapType.eql(self.Map, other.Map),
+                else => true,
+            };
+        } else return false;
+    }
 };
 
 const OptionalType = struct {
     child: Type,
+
+    const Self = @This();
+
+    fn eql(self: *Self, other: *Self) bool {
+        return Type.eql(self.child, other.child);
+    }
 };
 
 const ArrayType = struct {
     child: Type,
+
+    const Self = @This();
+
+    fn eql(self: *Self, other: *ArrayType) bool {
+        return Type.eql(&self.child, &other.child);
+    }
 };
 
 const MapType = struct {
     children: []const Field,
+
+    const Self = @This();
+
+    fn eql(self: *Self, other: *MapType) bool {
+        if (self.children.len == other.children.len) {
+            for (self.children) |*child, i| {
+                if (!child.eql(other.children[i])) {
+                    return false;
+                }
+            }
+        } else return false;
+        return true;
+    }
 };
 
 const Field = struct {
     name: []const u8,
     type_: Type,
+
+    const Self = @This();
+
+    fn eql(self: *Self, other: *Field) bool {
+        return self.type_ == other.type_ and std.mem.eql(u8, self.name, other.name);
+    }
 };
 
 const SchemeParser = struct {
@@ -266,4 +310,89 @@ test "SchemeParser can parse map type" {
         try _t.expectEqual(Type.Map, fields[0].type_);
         try _t.expectEqual(Type.Bool, fields[0].type_.Map.children[0].type_);
     }
+    {
+        const SCHEME = "access: {bedroom: bool, bathroom: {water_switch: bool, light_switch: bool}};";
+        var parser = SchemeParser.init(_t.allocator);
+        var fields = try parser.parse(SCHEME);
+        defer parser.free(fields);
+        try _t.expectEqual(@as(usize, 2), fields[0].type_.Map.children.len);
+        try _t.expectEqual(Type.Map, fields[0].type_);
+        try _t.expectEqual(Type.Map, fields[0].type_.Map.children[1].type_);
+    }
 }
+
+const FixedBufferStream = std.io.FixedBufferStream;
+
+const ESCAPE_CHARS: []const u8 = .{'\\', ',', '{', '}', '[', ']'};
+
+const DataBuilder = struct {
+    scheme: []Field,
+    values: []FieldValue,
+    nextFieldPos: usize = 0,
+
+    const Self = @This();
+
+    const FieldValue = union(enum) {
+        String: []const u8,
+        Int: i64,
+        Float: f64,
+        Bool: bool,
+        Null: void,
+        Array: []const FieldValue,
+        Map: *DataBuilder,
+    };
+
+    const BuildConfig = struct {
+        stringEscape: StringEscapeMethod = .Quote,
+    };
+
+    const StringEscapeMethod = enum {
+        Quote, Escape, Smart,
+    };
+
+    const Error = error {
+        EOF,
+        BadValue,
+    };
+
+    fn ensureArrayType(expectedElType: Type, arr: []const FieldValue) bool {
+        for (arr) |arrEl| {
+            if (!ensureType(expectedElType, arrEl)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn ensureType(expected: Type, actual: FieldValue) bool {
+        return switch (expected) {
+            .String => actual == .String,
+            .Int => actual == .Int,
+            .Float => actual == .Float,
+            .Bool => actual == .Bool,
+            .Optional => |optionalInfo| actual == .Null or ensureType(optionalInfo.child, @field(actual, @tagName(actual))),
+            .Array => |arrInfo| actual == .Array and ensureArrayType(arrInfo.child, actual.Array),
+            .Map => |mapInfo| actual == .Map and MapType.eql(&.{.children = actual.Map.scheme}, mapInfo),
+        };
+    }
+
+    fn isEscapeChar(ch: u8) bool { // TODO: smarter escape algorithm, use "" to quote as string
+        inline for (ESCAPE_CHARS) |esch| {
+            if (esch == ch) return true;
+        }
+        return false;
+    }
+
+    pub fn buildNext(self: *Self, writer: FixedBufferStream([]u8).Writer, config: BuildConfig) !void {
+        if (self.nextFieldPos >= self.scheme.len) return Error.EOF;
+        defer self.nextFieldPos += 1;
+        const pos = self.nextFieldPos;
+
+        var fieldVal = self.values[pos];
+        var fieldType = self.scheme[pos];
+        if (!ensureType(fieldType, fieldVal)) {
+            return Error.BadValue;
+        }
+        // TODO: buildNext
+    }
+};
