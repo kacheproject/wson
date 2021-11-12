@@ -2,7 +2,7 @@
 //! Example:
 //! name: string, age: int, sex: int, habit: ?[]string, using: bool, access: {bedroom: bool, bathroom: bool};
 //! Person,64,0,[Singing, Painting],T,{T, F};
-//! Pokson,89,1,null,F,{F, F};
+//! Pokson,89,1,,F,{F, F};
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -423,7 +423,7 @@ const DataBuilder = struct {
             },
             .Optional => {
                 if (fieldVal == .Null) {
-                    _ = try writer.write("null");
+                    // Do nothing
                 } else {
                     try writeValue(fieldType.Optional.child, fieldVal, bufStream, nestedConfig);
                 }
