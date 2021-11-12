@@ -18,9 +18,9 @@ const Type = union(enum) {
 
     const Self = @This();
 
-    fn eql(self: *Self, other: *Self) bool {
-        if (self == other) {
-            return switch(self) {
+    fn eql(self: *const Self, other: *const Self) bool {
+        if (std.meta.activeTag(self.*) == std.meta.activeTag(other.*)) {
+            return switch(self.*) {
                 .Optional => OptionalType.eql(self.Optional, other.Optional),
                 .Array => ArrayType.eql(self.Array, other.Array),
                 .Map => MapType.eql(self.Map, other.Map),
@@ -35,8 +35,8 @@ const OptionalType = struct {
 
     const Self = @This();
 
-    fn eql(self: *Self, other: *Self) bool {
-        return Type.eql(self.child, other.child);
+    fn eql(self: *const Self, other: *const Self) bool {
+        return Type.eql(&self.child, &other.child);
     }
 };
 
@@ -45,7 +45,7 @@ const ArrayType = struct {
 
     const Self = @This();
 
-    fn eql(self: *Self, other: *ArrayType) bool {
+    fn eql(self: *const Self, other: *const Self) bool {
         return Type.eql(&self.child, &other.child);
     }
 };
@@ -55,10 +55,10 @@ const MapType = struct {
 
     const Self = @This();
 
-    fn eql(self: *Self, other: *MapType) bool {
+    fn eql(self: *const Self, other: *const Self) bool {
         if (self.children.len == other.children.len) {
             for (self.children) |*child, i| {
-                if (!child.eql(other.children[i])) {
+                if (!child.eql(&other.children[i])) {
                     return false;
                 }
             }
@@ -73,8 +73,8 @@ const Field = struct {
 
     const Self = @This();
 
-    fn eql(self: *Self, other: *Field) bool {
-        return self.type_ == other.type_ and std.mem.eql(u8, self.name, other.name);
+    fn eql(self: *const Self, other: *const Field) bool {
+        return Type.eql(&self.type_, &other.type_) and std.mem.eql(u8, self.name, other.name);
     }
 };
 
@@ -194,17 +194,24 @@ const SchemeParser = struct {
         }
     }
 
+    fn freeType(self: *Self, t: Type) void {
+        switch (t) {
+            .Optional => |v| {
+                self.freeType(v.child);
+                self.alloc.destroy(v);
+            },
+            .Array => |v| self.alloc.destroy(v),
+            .Map => |v| {
+                self.free(v.children);
+                self.alloc.destroy(v);
+            },
+            else => {},
+        }
+    }
+
     pub fn free(self: *Self, fields: []const Field) void {
         for (fields) |f| {
-            switch (f.type_) {
-                .Optional => |v| self.alloc.destroy(v),
-                .Array => |v| self.alloc.destroy(v),
-                .Map => |v| {
-                    self.free(v.children);
-                    self.alloc.destroy(v);
-                },
-                else => {},
-            }
+            self.freeType(f.type_);
         }
         self.alloc.free(fields);
     }
@@ -323,12 +330,14 @@ test "SchemeParser can parse map type" {
 
 const FixedBufferStream = std.io.FixedBufferStream;
 
-const ESCAPE_CHARS: []const u8 = .{'\\', ',', '{', '}', '[', ']'};
+const ESCAPE_CHARS = [_]u8{'\\', ','};
 
 const DataBuilder = struct {
-    scheme: []Field,
+    scheme: []const Field,
     values: []FieldValue,
     nextFieldPos: usize = 0,
+    alloc: std.heap.ArenaAllocator,
+    backendAlloc: *Allocator,
 
     const Self = @This();
 
@@ -343,15 +352,19 @@ const DataBuilder = struct {
     };
 
     const BuildConfig = struct {
-        stringEscape: StringEscapeMethod = .Quote,
-    };
+        noEndMark: bool = false, // if it's true, the builder will no write the ';' at the end of the values
 
-    const StringEscapeMethod = enum {
-        Quote, Escape, Smart,
+        fn merge(self: BuildConfig, other: BuildConfig, comptime fieldNames: anytype) BuildConfig {
+            var copy = self;
+            inline for (std.meta.fields(@TypeOf(fieldNames))) |field| {
+                const name = @field(fieldNames, field.name);
+                @field(copy, name) = @field(other, name);
+            }
+            return copy;
+        }
     };
 
     const Error = error {
-        EOF,
         BadValue,
     };
 
@@ -370,29 +383,217 @@ const DataBuilder = struct {
             .Int => actual == .Int,
             .Float => actual == .Float,
             .Bool => actual == .Bool,
-            .Optional => |optionalInfo| actual == .Null or ensureType(optionalInfo.child, @field(actual, @tagName(actual))),
+            .Optional => |optionalInfo| actual == .Null or ensureType(optionalInfo.child, actual),
             .Array => |arrInfo| actual == .Array and ensureArrayType(arrInfo.child, actual.Array),
             .Map => |mapInfo| actual == .Map and MapType.eql(&.{.children = actual.Map.scheme}, mapInfo),
         };
     }
 
-    fn isEscapeChar(ch: u8) bool { // TODO: smarter escape algorithm, use "" to quote as string
+    fn isEscapeChar(ch: u8) bool {
         inline for (ESCAPE_CHARS) |esch| {
             if (esch == ch) return true;
         }
         return false;
     }
 
-    pub fn buildNext(self: *Self, writer: FixedBufferStream([]u8).Writer, config: BuildConfig) !void {
-        if (self.nextFieldPos >= self.scheme.len) return Error.EOF;
-        defer self.nextFieldPos += 1;
+    fn isEndOfFields(self: *Self) bool {
+        return self.nextFieldPos >= self.scheme.len;
+    }
+
+    fn writeValue(fieldType: Type, fieldVal: FieldValue, bufStream: *FixedBufferStream([]u8), config: BuildConfig) (FixedBufferStream([]u8).WriteError||Error||Allocator.Error||error{EOF})!void {
+        var writer = bufStream.writer();
+        const nestedConfig = config.merge(BuildConfig {.noEndMark=true}, .{"noEndMark"});
+        switch (fieldType) {
+            .String => {
+                for (fieldVal.String) |ch| {
+                    if (isEscapeChar(ch)) {
+                        try writer.writeIntNative(u8, '\\');
+                    }
+                    try writer.writeIntNative(u8, ch);
+                }
+            },
+            .Bool => {
+                try writer.writeIntNative(u8, @as(u8, if (fieldVal.Bool) 'T' else 'F'));
+            },
+            .Int => {
+                try std.fmt.format(writer, "{}", .{fieldVal.Int});
+            },
+            .Float => {
+                try std.fmt.format(writer, "{}", .{fieldVal.Float});
+            },
+            .Optional => {
+                if (fieldVal == .Null) {
+                    _ = try writer.write("null");
+                } else {
+                    try writeValue(fieldType.Optional.child, fieldVal, bufStream, nestedConfig);
+                }
+            },
+            .Array => {
+                try writer.writeIntNative(u8, '[');
+                var arr = fieldVal.Array;
+                for (arr) |item, i| {
+                    try writeValue(fieldType.Array.child, item, bufStream, nestedConfig);
+                    if (i != (arr.len-1)) {
+                        try writer.writeIntNative(u8, ',');
+                    }
+                }
+                try writer.writeIntNative(u8, ']');
+            },
+            .Map => {
+                var builder = fieldVal.Map;
+                try writer.writeIntNative(u8, '{');
+                try builder.build(bufStream, nestedConfig);
+                try writer.writeIntNative(u8, '}');
+            }
+        }
+    }
+
+    pub fn buildNext(self: *Self, bufStream: *FixedBufferStream([]u8), config: BuildConfig) !void {
+        _ = config;
+        if (self.isEndOfFields())
+            return error.EOF;
         const pos = self.nextFieldPos;
 
         var fieldVal = self.values[pos];
-        var fieldType = self.scheme[pos];
-        if (!ensureType(fieldType, fieldVal)) {
+        var field = self.scheme[pos];
+        if (!ensureType(field.type_, fieldVal)) {
             return Error.BadValue;
         }
-        // TODO: buildNext
+        const oldPos = bufStream.pos;
+        errdefer bufStream.seekTo(oldPos) catch unreachable;
+        try writeValue(field.type_, fieldVal, bufStream, .{});
+        self.nextFieldPos += 1;
+        errdefer self.nextFieldPos -= 1;
+        if (self.isEndOfFields()) {
+            if (!config.noEndMark) _ = try bufStream.write(";");
+        } else {
+            _ = try bufStream.write(",");
+        }
+    }
+
+    pub fn build(self: *Self, writer: *FixedBufferStream([]u8), config: BuildConfig) !void {
+        while (true) {
+            self.buildNext(writer, config) catch |e| switch (e) {
+                error.EOF => return,
+                else => return e,
+            };
+        }
+    }
+
+    /// Caller owns `scheme` and `buf`. They should not be free'd for DataBuilder working.
+    pub fn init(scheme: []const Field, alloc: *Allocator) Self {
+        return Self {
+            .scheme = scheme,
+            .values = &.{},
+            .alloc = std.heap.ArenaAllocator.init(alloc),
+            .backendAlloc = alloc,
+        };
+    }
+
+    pub fn reset(self: *Self) void {
+        self.alloc.deinit();
+        self.alloc = std.heap.ArenaAllocator.init(self.backendAlloc);
+        self.nextFieldPos = 0;
+        self.values = &.{};
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.alloc.deinit();
+    }
+
+    pub fn getFieldValue(self: *Self, comptime T: type, val: T) Allocator.Error!FieldValue {
+        const info = @typeInfo(T);
+        if (comptime std.meta.trait.isZigString(T)) {
+            return FieldValue {.String = val};
+        } else if (T == bool) {
+            return FieldValue {.Bool = val};
+        } else if (info == .Int) {
+            return FieldValue {.Int = @intCast(i64, val)};
+        } else if (info == .Optional) {
+            if (val != null) {
+                return self.getFieldValue(info.Optional.child, val);
+            } else {
+                return .Null;
+            }
+        } else if (info == .Float) {
+            return FieldValue {.Float = val};
+        } else if (comptime std.meta.trait.isSlice(T)) {
+            if (info.Pointer.child == FieldValue) {
+                return FieldValue {.Array = val};
+            } else {
+                var values = try self.alloc.allocator.alloc(FieldValue, val.len);
+                for (val) |item, i| {
+                    values[i] = try self.getFieldValue(@TypeOf(item), item);
+                }
+                return FieldValue {.Array = values};
+            }
+        } else if (info == .Pointer and info.Pointer.child == DataBuilder) {
+            return FieldValue {.Map = val};
+        } else if (T == FieldValue) {
+            return val;
+        } else @compileError(comptime std.fmt.comptimePrint("unexpected type \'{}\'", .{T}));
+    }
+
+    fn isHashMapDuck(comptime T: type) bool {
+        return @typeInfo(T) == .Struct and @hasDecl(T, "count") and @hasDecl(T, "keyIterator") and @hasDecl(T, "get");
+    }
+
+    pub fn getValues(self: *Self) Allocator.Error![]FieldValue {
+        if (self.values.len == 0) {
+            self.values = try self.alloc.allocator.alloc(FieldValue, self.scheme.len);
+        }
+        return self.values;
+    }
+
+    pub fn put(self: *Self, comptime T: type, key: []const u8, val: T) !void {
+        _ = try self.getValues();
+        for (self.scheme) |field, i| {
+            if (std.mem.eql(u8, field.name, key)) {
+                if (T == std.StringHashMap(FieldValue) or T == std.StringArrayHashMap(FieldValue)) {
+                    if (field.type_ != .Map and (field.type_ == .Optional and field.type_.Optional.child != .Map)) return Error.BadValue;
+                    const typ = if (field.type_ == .Optional) field.type_.Optional.child else field.type_;
+                    var fieldVals = try self.alloc.allocator.alloc(FieldValue, val.count());
+                    errdefer self.alloc.allocator.free(fieldVals);
+                    var builder = try self.alloc.allocator.create(DataBuilder);
+                    builder.* = DataBuilder.init(typ.Map.children, &self.alloc.allocator);
+                    errdefer self.alloc.allocator.destroy(builder);
+                    var iter = val.keyIterator();
+                    while (iter.next()) |k| {
+                        try builder.put(FieldValue, k.*, val.get(k.*).?);
+                    }
+                    self.values[i] = try self.getFieldValue(*DataBuilder, builder);
+                } else {
+                    self.values[i] = try self.getFieldValue(T, val);
+                }
+                break;
+            }
+        }
     }
 };
+
+test "DataBuilder" {
+    const t = std.testing;
+    {
+        const SCHEME_TEXT = "name: string, year: int, enabled: bool, main_characters: []string, buy_on: ?{steam: bool, epic: bool};";
+        var schemeParser = SchemeParser.init(t.allocator);
+        var scheme = try schemeParser.parse(SCHEME_TEXT);
+        defer schemeParser.free(scheme);
+        var dataBuilder = DataBuilder.init(scheme, t.allocator);
+        defer dataBuilder.deinit();
+        try dataBuilder.put([]const u8, "name", "Titanfall 2");
+        try dataBuilder.put(i16, "year", 2016);
+        try dataBuilder.put(bool, "enabled", true);
+        var characters = [_][]const u8{"Jack Cooper", "BT-7274"};
+        try dataBuilder.put([][]const u8, "main_characters", &characters);
+        var buyOnTable = std.StringHashMap(DataBuilder.FieldValue).init(t.allocator);
+        defer buyOnTable.deinit();
+        try buyOnTable.put("steam", try dataBuilder.getFieldValue(bool, true));
+        try buyOnTable.put("epic", try dataBuilder.getFieldValue(bool, false));
+        try dataBuilder.put(std.StringHashMap(DataBuilder.FieldValue), "buy_on", buyOnTable);
+        var resultBuf = std.mem.zeroes([2048:0]u8);
+        var resultStream = std.io.fixedBufferStream(&resultBuf);
+        try dataBuilder.build(&resultStream, .{});
+        // std.debug.print("result=\"{s}\"\n", .{resultBuf});
+        try t.expectEqualStrings("Titanfall 2,2016,T,[Jack Cooper,BT-7274],{T,F};", resultStream.getWritten());
+    }
+}
