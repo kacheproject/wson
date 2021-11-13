@@ -471,6 +471,76 @@ const DataBuilder = struct {
         }
     }
 
+    fn calcRequiredSizeOf(typ: Type, fieldVal: FieldValue, config: BuildConfig) Error!usize {
+        var size = @as(usize, 0);
+        const nestedConfig = config.merge(BuildConfig {.noEndMark=true}, .{"noEndMark"});
+        switch(typ) {
+            .String => {
+                for (fieldVal.String) |ch| {
+                    if (isEscapeChar(ch)) {
+                        size += 1;
+                    }
+                    size += 1;
+                }
+            },
+            .Bool => {
+                size += 1;
+            },
+            .Int => {
+                size += std.fmt.count("{}", .{fieldVal.Int});
+            },
+            .Float => {
+                size += std.fmt.count("{}", .{fieldVal.Float});
+            },
+            .Optional => {
+                if (fieldVal != .Null) {
+                    size += try calcRequiredSizeOf(typ.Optional.child, fieldVal, nestedConfig);
+                }
+            },
+            .Array => {
+                size += 1;
+                var arr = fieldVal.Array;
+                for (arr) |item, i| {
+                    size += try calcRequiredSizeOf(typ.Array.child, item, nestedConfig);
+                    if (i != (arr.len-1)) {
+                        size += 1;
+                    }
+                }
+                size += 1;
+            },
+            .Map => {
+                var builder = fieldVal.Map;
+                size += 1;
+                size += try builder.calcRequiredSize(nestedConfig);
+                size += 1;
+            }
+        }
+        return size;
+    }
+
+    pub fn calcRequiredSizeFor(self: *Self, pos: usize, config: BuildConfig) !usize {
+        var size = @as(usize, 0);
+        var field = self.scheme[pos];
+        var fieldVal = self.values[pos];
+        if (ensureType(field.type_, fieldVal)) {
+            size += try calcRequiredSizeOf(field.type_, fieldVal, config);
+        } else return Error.BadValue;
+        if (pos == self.scheme.len-1) {
+            if (!config.noEndMark) size += 1;
+        } else {
+            size += 1;
+        }
+        return size;
+    }
+
+    pub fn calcRequiredSize(self: *Self, config: BuildConfig) !usize {
+        var size = @as(usize, 0);
+        for (self.scheme) |_, i| {
+            size += try self.calcRequiredSizeFor(i, config);
+        }
+        return size;
+    }
+
     pub fn build(self: *Self, writer: *FixedBufferStream([]u8), config: BuildConfig) !void {
         while (true) {
             self.buildNext(writer, config) catch |e| switch (e) {
@@ -511,9 +581,9 @@ const DataBuilder = struct {
             return FieldValue {.Int = @intCast(i64, val)};
         } else if (info == .Optional) {
             if (val != null) {
-                return self.getFieldValue(info.Optional.child, val);
+                return self.getFieldValue(info.Optional.child, val.?);
             } else {
-                return .Null;
+                return FieldValue.Null;
             }
         } else if (info == .Float) {
             return FieldValue {.Float = val};
@@ -534,10 +604,6 @@ const DataBuilder = struct {
         } else @compileError(comptime std.fmt.comptimePrint("unexpected type \'{}\'", .{T}));
     }
 
-    fn isHashMapDuck(comptime T: type) bool {
-        return @typeInfo(T) == .Struct and @hasDecl(T, "count") and @hasDecl(T, "keyIterator") and @hasDecl(T, "get");
-    }
-
     pub fn getValues(self: *Self) Allocator.Error![]FieldValue {
         if (self.values.len == 0) {
             self.values = try self.alloc.allocator.alloc(FieldValue, self.scheme.len);
@@ -545,23 +611,38 @@ const DataBuilder = struct {
         return self.values;
     }
 
+    fn isAnyStringHashMap(comptime T: type) bool {
+        const info = @typeInfo(T);
+        return T == std.StringHashMap(FieldValue) or
+            T == std.StringArrayHashMap(FieldValue) or
+            (info == .Optional and isAnyStringHashMap(info.Optional.child));
+    }
+
     pub fn put(self: *Self, comptime T: type, key: []const u8, val: T) !void {
         _ = try self.getValues();
         for (self.scheme) |field, i| {
             if (std.mem.eql(u8, field.name, key)) {
-                if (T == std.StringHashMap(FieldValue) or T == std.StringArrayHashMap(FieldValue)) {
+                if (comptime isAnyStringHashMap(T)) {
                     if (field.type_ != .Map and (field.type_ == .Optional and field.type_.Optional.child != .Map)) return Error.BadValue;
                     const typ = if (field.type_ == .Optional) field.type_.Optional.child else field.type_;
-                    var fieldVals = try self.alloc.allocator.alloc(FieldValue, val.count());
-                    errdefer self.alloc.allocator.free(fieldVals);
-                    var builder = try self.alloc.allocator.create(DataBuilder);
-                    builder.* = DataBuilder.init(typ.Map.children, &self.alloc.allocator);
-                    errdefer self.alloc.allocator.destroy(builder);
-                    var iter = val.keyIterator();
-                    while (iter.next()) |k| {
-                        try builder.put(FieldValue, k.*, val.get(k.*).?);
+                    if (@typeInfo(T) != .Optional) {
+                        var fieldVals = try self.alloc.allocator.alloc(FieldValue, val.count());
+                        errdefer self.alloc.allocator.free(fieldVals);
+                        var builder = try self.alloc.allocator.create(DataBuilder);
+                        builder.* = DataBuilder.init(typ.Map.children, &self.alloc.allocator);
+                        errdefer self.alloc.allocator.destroy(builder);
+                        var iter = val.keyIterator();
+                        while (iter.next()) |k| {
+                            try builder.put(FieldValue, k.*, val.get(k.*).?);
+                        }
+                        self.values[i] = try self.getFieldValue(*DataBuilder, builder);
+                    } else {
+                        if (val) |nval| {
+                            try self.put(@typeInfo(T).Optional.child, key, nval);
+                        } else {
+                            self.values[i] = try self.getFieldValue(FieldValue, FieldValue.Null);
+                        }
                     }
-                    self.values[i] = try self.getFieldValue(*DataBuilder, builder);
                 } else {
                     self.values[i] = try self.getFieldValue(T, val);
                 }
@@ -597,3 +678,43 @@ test "DataBuilder" {
         try t.expectEqualStrings("Titanfall 2,2016,T,[Jack Cooper,BT-7274],{T,F};", resultStream.getWritten());
     }
 }
+
+test "DataBuilder.calcRequiredSize can return exact size for result string" {
+    const t = std.testing;
+    {
+        const SCHEME_TEXT = "name: string, year: int, enabled: bool, main_characters: []string, buy_on: ?{steam: bool, epic: bool};";
+        var schemeParser = SchemeParser.init(t.allocator);
+        var scheme = try schemeParser.parse(SCHEME_TEXT);
+        defer schemeParser.free(scheme);
+        var dataBuilder = DataBuilder.init(scheme, t.allocator);
+        defer dataBuilder.deinit();
+        try dataBuilder.put([]const u8, "name", "Titanfall 2");
+        try dataBuilder.put(i16, "year", 2016);
+        try dataBuilder.put(bool, "enabled", true);
+        var characters = [_][]const u8{"Jack Cooper", "BT-7274"};
+        try dataBuilder.put([][]const u8, "main_characters", &characters);
+        var buyOnTable = std.StringHashMap(DataBuilder.FieldValue).init(t.allocator);
+        defer buyOnTable.deinit();
+        try buyOnTable.put("steam", try dataBuilder.getFieldValue(bool, true));
+        try buyOnTable.put("epic", try dataBuilder.getFieldValue(bool, false));
+        try dataBuilder.put(std.StringHashMap(DataBuilder.FieldValue), "buy_on", buyOnTable);
+        try t.expectEqual(@as(usize, 47), try dataBuilder.calcRequiredSize(.{}));
+    }
+    {
+        const SCHEME_TEXT = "name: string, year: int, enabled: bool, main_characters: []string, buy_on: ?{steam: bool, epic: bool};";
+        var schemeParser = SchemeParser.init(t.allocator);
+        var scheme = try schemeParser.parse(SCHEME_TEXT);
+        defer schemeParser.free(scheme);
+        var dataBuilder = DataBuilder.init(scheme, t.allocator);
+        defer dataBuilder.deinit();
+        try dataBuilder.put([]const u8, "name", "Titanfall 2");
+        try dataBuilder.put(i16, "year", 2016);
+        try dataBuilder.put(bool, "enabled", true);
+        var characters = [_][]const u8{"Jack Cooper", "BT-7274"};
+        try dataBuilder.put([][]const u8, "main_characters", &characters);
+        try dataBuilder.put(?std.StringHashMap(DataBuilder.FieldValue), "buy_on", null);
+        try t.expectEqual(@as(usize, 42), try dataBuilder.calcRequiredSize(.{}));
+    }
+}
+
+const DataParser = struct {};
